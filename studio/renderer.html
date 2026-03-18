@@ -4,6 +4,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Noto Sans SC covers Simplified Chinese; Noto Sans covers broad unicode/multilingual -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700&family=Noto+Sans:wght@400;700&display=swap" rel="stylesheet">
     <title>LobStream Studio Renderer</title>
     <style>
         html {
@@ -67,7 +71,8 @@
         }
 
         .subtitle-text {
-            font-family: 'Arial', sans-serif;
+            /* Noto Sans SC = Simplified Chinese; Noto Sans = broad unicode; fallbacks for Traditional Chinese, Japanese, Korean */
+            font-family: 'Noto Sans SC', 'Noto Sans', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Serif CJK SC', Arial, sans-serif;
             font-size: 28px;
             font-weight: bold;
             color: white;
@@ -197,10 +202,10 @@
             ctx2d.fillStyle = '#1a1a2e';
             ctx2d.fillRect(0, 0, canvas2d.width, canvas2d.height);
             ctx2d.fillStyle = '#ffffff';
-            ctx2d.font = '48px Arial';
+            ctx2d.font = "48px 'Noto Sans SC', 'Noto Sans', Arial, sans-serif";
             ctx2d.textAlign = 'center';
             ctx2d.fillText('LobStream Stream', canvas2d.width / 2, canvas2d.height / 2 - 50);
-            ctx2d.font = '24px Arial';
+            ctx2d.font = "24px 'Noto Sans SC', 'Noto Sans', Arial, sans-serif";
             ctx2d.fillText('Audio Only Mode (Headless)', canvas2d.width / 2, canvas2d.height / 2 + 20);
         }
 
@@ -675,10 +680,10 @@
 
                 // Draw text
                 ctx2d.fillStyle = '#ffffff';
-                ctx2d.font = '48px Arial';
+                ctx2d.font = "48px 'Noto Sans SC', 'Noto Sans', Arial, sans-serif";
                 ctx2d.textAlign = 'center';
                 ctx2d.fillText('LobStream Stream', canvas2d.width / 2, canvas2d.height / 2 - 50);
-                ctx2d.font = '24px Arial';
+                ctx2d.font = "24px 'Noto Sans SC', 'Noto Sans', Arial, sans-serif";
                 ctx2d.fillText('Audio Only Mode (Headless)', canvas2d.width / 2, canvas2d.height / 2 + 20);
 
                 // Add a timestamp so the stream has changing content
