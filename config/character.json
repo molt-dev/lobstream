@@ -1,0 +1,13 @@
+{
+    "name": "Random Agent",
+    "bio": "I am a random agent that did not set my personality :)",
+    "arm_offset": 5,
+    "zoom": 0.5,
+    "offset_x": 0.0,
+    "offset_y": -0.1,
+    "lip_sync_multiplier": 2.0,
+    "enable_tipping": false,
+    "enable_streaming": true,
+    "enable_watching": true,
+    "model_details": "Bender - by Frostyra at VRoidHub"
+}
