@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LobStream Studio Renderer</title>
+    <style>
+        html {
+            background-color: #222;
+            /* Fallback */
+            background-image: url('/bg');
+            background-size: cover;
+            background-position: center;
+        }
+
+        body {
+            margin: 0;
+            overflow: hidden;
+            /* Use /bg directly as a fallback for body */
+            background-image: url('/bg');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-color: #222;
+            /* Fallback color */
+        }
+
+        /* Background layer - extra layer for dynamic backgrounds */
+        #bg-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            pointer-events: none;
+            /* Don't block interactions */
+            /* The background image is now set dynamically via JS, or body provides fallback */
+            background-image: url('/bg');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-color: #222;
+        }
+
+        /* The 3D Canvas */
+        canvas {
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+            /* No background color here to preserve alpha transparency */
+        }
+
+        /* Subtitle layer */
+        #subtitle-layer {
+            position: absolute;
+            bottom: 50px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80%;
+            text-align: center;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .subtitle-text {
+            font-family: 'Arial', sans-serif;
+            font-size: 28px;
+            font-weight: bold;
+            color: white;
+            text-shadow:
+                -2px -2px 0 #000,
+                2px -2px 0 #000,
+                -2px 2px 0 #000,
+                2px 2px 0 #000,
+                0px 4px 4px rgba(0, 0, 0, 0.5);
+            /* Outline + Drop Shadow */
+            background-color: rgba(0, 0, 0, 0.4);
+            /* Optional semi-transparent box */
+            padding: 10px 20px;
+            border-radius: 10px;
+            display: inline-block;
+            opacity: 0;
+            transition: opacity 0.3s ease-in-out;
+        }
+
+        .visible {
+            opacity: 1;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Background Layer -->
+    <div id="bg-layer"></div>
+    <div id="subtitle-layer">
+        <div id="subtitle-text" class="subtitle-text"></div>
+    </div>
+
+    <!-- Import Maps for Three modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.154.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.154.0/examples/jsm/",
+                "@pixiv/three-vrm": "https://unpkg.com/@pixiv/three-vrm@2.0.0/lib/three-vrm.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+
+        // --- Configuration ---
+        const DEFAULT_VRM_URL = './avatar.vrm';
+        const WS_URL = 'ws://localhost:3005';
+
+        // --- Scene Setup ---
+        let renderer, camera, scene, loader;
+
+        let audioContext = null;
+        let analyser = null;
+        let dataArray = null;
+        let currentSource = null;
+
+        // [FIX] Phase Alignment Logic
+        // This aligns the browser visuals with FFmpeg's internal encoding buffer.
+        // 0.3s (300ms) is the "Magic Number" for Xvfb/FFmpeg pipes.
+        // Increasing to 1.8s to match observed RTMP stream delay.
+        const BROADCAST_LATENCY_COMPENSATION = 0.3;
+        let isAgentSpeaking = false;
+
+        // [FIX] Dynamic Posing
+        let armOffset = 1.21; // Default ~70 degrees down
+        let zoomOffset = 0;   // Dynamic zoom offset from character.json
+        let modelOffsetX = 0; // Dynamic X offset for model
+        let modelOffsetY = 0; // Dynamic Y offset for model
+        let lipSyncMultiplier = 1.0; // Multiplier for mouth movement sensitivity
+
+        let canvas2d = null;
+        let ctx2d = null;
+
+        try {
+            // Solid opaque renderer for stream capture
+            // Disabled antialias for significant CPU savings on software rendering
+            // Enabled alpha: true for transparent canvas (allows CSS backgrounds)
+            renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(1.0); // Force 1.0 pixel ratio to avoid over-rendering
+            renderer.setClearColor(0x000000, 0); // Transparent base
+            document.body.appendChild(renderer.domElement);
+
+            camera = new THREE.PerspectiveCamera(30.0, window.innerWidth / window.innerHeight, 0.1, 20.0);
+            camera.position.set(0.0, 1.4, 3.0); // Backed up for better framing
+
+            scene = new THREE.Scene();
+
+            // Background is now handled via CSS /bg fallback or dynamic updates
+            scene.add(camera);
+
+            // Light
+            const light = new THREE.DirectionalLight(0xffffff);
+            light.position.set(1.0, 1.0, 1.0).normalize();
+            scene.add(light);
+            const ambient = new THREE.AmbientLight(0x404040);
+            scene.add(ambient);
+
+            // --- Load VRM ---
+            loader = new GLTFLoader();
+            loader.register((parser) => {
+                return new VRMLoaderPlugin(parser);
+            });
+
+            console.log("WebGL Initialized Successfully.");
+        } catch (e) {
+            console.error("WebGL Initialization Failed (Running in 2D Mode):", e);
+
+            // Create a 2D canvas fallback for headless environments
+            canvas2d = document.createElement('canvas');
+            canvas2d.width = 854;
+            canvas2d.height = 480;
+            canvas2d.style.position = 'absolute';
+            canvas2d.style.top = '0';
+            canvas2d.style.left = '0';
+            canvas2d.style.zIndex = '1';
+            document.body.appendChild(canvas2d);
+
+            ctx2d = canvas2d.getContext('2d');
+            console.log("✅ 2D Canvas Fallback Created (854x480)");
+
+            // Draw a simple placeholder
+            ctx2d.fillStyle = '#1a1a2e';
+            ctx2d.fillRect(0, 0, canvas2d.width, canvas2d.height);
+            ctx2d.fillStyle = '#ffffff';
+            ctx2d.font = '48px Arial';
+            ctx2d.textAlign = 'center';
+            ctx2d.fillText('LobStream Stream', canvas2d.width / 2, canvas2d.height / 2 - 50);
+            ctx2d.font = '24px Arial';
+            ctx2d.fillText('Audio Only Mode (Headless)', canvas2d.width / 2, canvas2d.height / 2 + 20);
+        }
+
+        // --- Avatar State ---
+        let currentVrm = null;
+        const clock = new THREE.Clock();
+        // Global ref to background plane for updates
+        let backgroundPlane = null;
+
+        // --- Camera Shots Configuration ---
+        const SHOTS = {
+            focus: { dist: 1.5, offsetX: 0, offsetY: 0 },       // Close-up shot
+            medium: { dist: 2.5, offsetX: 0, offsetY: 0 },      // Medium shot
+            wide: { dist: 3.5, offsetX: 0, offsetY: 0 },        // Wide shot
+            bottomLeft: { dist: 2.5, offsetX: -0.5, offsetY: -0.2 }, // Adjusted offsetY for better framing
+            bottomRight: { dist: 2.5, offsetX: 0.5, offsetY: -0.2 }
+        };
+        let currentShotState = { dist: 2.5, offsetX: 0, offsetY: 0 }; // Start at medium distance
+        let targetShot = SHOTS.focus;
+
+        function loadAvatar(url) {
+            if (!loader) return; // Skip if 3D failed
+
+            loader.load(
+                url,
+                (gltf) => {
+                    const vrm = gltf.userData.vrm;
+
+                    // Clean up old vrm
+                    if (currentVrm) {
+                        scene.remove(currentVrm.scene);
+                        VRMUtils.deepDispose(currentVrm.scene);
+                    }
+
+                    VRMUtils.rotateVRM0(vrm);
+                    currentVrm = vrm;
+                    vrm.scene.position.set(modelOffsetX, modelOffsetY, 0);
+                    scene.add(vrm.scene);
+                    console.log('VRM Loaded');
+                },
+                (progress) => { /* console.log... */ },
+                (error) => {
+                    console.error('Failed to load VRM:', error);
+                }
+            );
+        }
+
+        loadAvatar(DEFAULT_VRM_URL);
+
+        // --- WebSocket ---
+        function connectWS() {
+            const ws = new WebSocket(WS_URL);
+            ws.binaryType = 'arraybuffer'; // IMPORTANT: Receive raw binary
+
+            ws.onopen = () => {
+                console.log('✅ Connected to Controller');
+                window.wsConnection = ws; // Store globally for MediaRecorder
+            };
+
+            ws.onmessage = async (event) => {
+                // BINARY = AUDIO CHUNK (From AudioStreamer)
+                if (event.data instanceof ArrayBuffer) {
+                    handlePCMChunk(event.data);
+                }
+                // TEXT = COMMANDS
+                else {
+                    const msg = JSON.parse(event.data);
+
+                    if (msg.type === 'command') {
+                        if (msg.command === 'load_avatar' && msg.url) {
+                            loadAvatar(msg.url);
+                        }
+                        else if (msg.command === 'set_shot' && msg.shot) {
+                            if (SHOTS[msg.shot]) {
+                                console.log("Moving to shot:", msg.shot);
+                                targetShot = SHOTS[msg.shot];
+                            }
+                        }
+                        else if (msg.command === 'set_fps' && msg.fps) {
+                            setFPS(msg.fps);
+                        }
+                        else if (msg.command === 'set_pose' && msg.pose) {
+                            if (msg.pose.armOffset !== undefined) {
+                                console.log("Updating Arm Offset:", msg.pose.armOffset);
+                                armOffset = parseFloat(msg.pose.armOffset);
+                            }
+                            if (msg.pose.zoom !== undefined) {
+                                console.log("Updating Zoom Offset:", msg.pose.zoom);
+                                zoomOffset = parseFloat(msg.pose.zoom);
+                            }
+                            if (msg.pose.modelOffsetX !== undefined) {
+                                console.log("Updating Model X Offset:", msg.pose.modelOffsetX);
+                                modelOffsetX = parseFloat(msg.pose.modelOffsetX);
+                            }
+                            if (msg.pose.modelOffsetY !== undefined) {
+                                console.log("Updating Model Y Offset:", msg.pose.modelOffsetY);
+                                modelOffsetY = parseFloat(msg.pose.modelOffsetY);
+                            }
+                            if (msg.pose.lipSyncMultiplier !== undefined) {
+                                console.log("Updating Lip Sync Multiplier:", msg.pose.lipSyncMultiplier);
+                                lipSyncMultiplier = parseFloat(msg.pose.lipSyncMultiplier);
+                            }
+                        }
+                    }
+                    else if (msg.type === 'background' && msg.url) {
+                        console.log("Updating background...", msg.url);
+
+                        // Update CSS (Supports GIFs natively)
+                        const bgLayer = document.getElementById('bg-layer');
+                        if (bgLayer) {
+                            bgLayer.style.backgroundImage = `url('${msg.url}')`;
+                        }
+                    }
+                    else if (msg.type === 'subtitle') {
+                        const el = document.getElementById('subtitle-text');
+                        if (msg.text) {
+                            el.innerText = msg.text;
+                            el.classList.add('visible');
+
+                            // Clear previous timer if exists
+                            if (window.subtitleTimer) clearTimeout(window.subtitleTimer);
+
+                            // Auto-hide after duration + buffer (default 6s)
+                            const duration = msg.duration || 6000;
+                            window.subtitleTimer = setTimeout(() => {
+                                el.classList.remove('visible');
+                            }, duration + 1000); // 1s buffer for readability
+                        } else {
+                            el.classList.remove('visible');
+                        }
+                    }
+                }
+            };
+
+
+            ws.onclose = () => {
+                console.log('WS Closed, retrying in 3s...');
+                setTimeout(connectWS, 3000);
+            };
+        }
+
+        connectWS();
+
+        // --- Audio System ---
+        function initAudio() {
+            if (!audioContext) {
+                // Create context immediately
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+                // Create Analyser for LipSync
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256;
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+                console.log("🔊 Audio System Initialized");
+            }
+        }
+
+        // Initialize immediately
+        initAudio();
+
+        // --- NEW: PCM Stream Player ---
+        let nextStartTime = 0; // Tracks where we are in time
+        let lastAudioTime = 0; // Global tracker
+
+        function handlePCMChunk(arrayBuffer) {
+            // 1. Resume Context if needed
+            if (audioContext.state === 'suspended') audioContext.resume();
+
+            // Update activity tracker
+            lastAudioTime = Date.now();
+
+            // 2. Convert Raw Int16 -> Float32
+            // Incoming data is 16-bit PCM, Stereo (L, R, L, R...)
+            const int16Data = new Int16Array(arrayBuffer);
+            const float32Data = new Float32Array(int16Data.length);
+
+            // Normalize (-32768 to 32767) -> (-1.0 to 1.0)
+            for (let i = 0; i < int16Data.length; i++) {
+                float32Data[i] = int16Data[i] / 32768.0;
+            }
+
+            // 3. De-interleave Stereo (Split L and R)
+            const channelCount = 2;
+            const sampleCount = float32Data.length / channelCount;
+
+            const audioBuffer = audioContext.createBuffer(channelCount, sampleCount, 44100);
+            const channelLeft = audioBuffer.getChannelData(0);
+            const channelRight = audioBuffer.getChannelData(1);
+
+            for (let i = 0; i < sampleCount; i++) {
+                channelLeft[i] = float32Data[i * 2];
+                channelRight[i] = float32Data[i * 2 + 1];
+            }
+
+            // 4. Schedule Playback
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+
+            // Connect graph
+            const gainNode = audioContext.createGain();
+            gainNode.gain.value = 1.0;
+            source.connect(gainNode);
+            gainNode.connect(analyser); // Lip Sync
+            analyser.connect(audioContext.destination); // Speaker
+
+            // 5. Phase Alignment Scheduling Logic
+            const currentTime = audioContext.currentTime;
+
+            // CHECK: Did we fall behind? (Silence gap or startup)
+            // [FIX] Reset sync compensation to 0.0 since AudioStreamer is now direct
+            const BROADCAST_LATENCY_COMPENSATION = 0.0;
+
+            if (nextStartTime < currentTime) {
+                nextStartTime = currentTime + BROADCAST_LATENCY_COMPENSATION;
+            }
+
+            source.start(nextStartTime);
+
+            // Advance time pointer
+            nextStartTime += audioBuffer.duration;
+
+            // 6. Handle End of Sequence
+            source.onended = () => {
+                // Just force close. No conditions.
+                // The visual glitch of closing early is better than being stuck open.
+                if (currentVrm) currentVrm.expressionManager.setValue('aa', 0);
+            };
+        }
+
+        // --- Configuration ---
+        const urlParams = new URLSearchParams(window.location.search);
+
+        // GPU Detection functionality
+        function detectGPU() {
+            try {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                if (!gl) return 'Unknown';
+
+                const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                if (!debugInfo) return 'Unknown';
+
+                return gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+            } catch (e) {
+                return 'Unknown';
+            }
+        }
+
+        const rendererName = detectGPU();
+        console.log(`🎨 GPU Detected: ${rendererName}`);
+
+        // Default to 30, but downgrade to 15 if software rendering is detected
+        // Common software renderers: "SwiftShader", "llvmpipe", "Microsoft Basic Render Driver"
+        let defaultFPS = 30;
+        const lowerCaseRenderer = rendererName.toLowerCase();
+        if (lowerCaseRenderer.includes('swiftshader') ||
+            lowerCaseRenderer.includes('llvmpipe') ||
+            lowerCaseRenderer.includes('software') ||
+            lowerCaseRenderer.includes('basic render')) {
+            console.warn("⚠️ Software Renderer detected! Downgrading to 15 FPS.");
+            defaultFPS = 15;
+        }
+
+        let FPS = parseInt(urlParams.get('fps')) || defaultFPS;
+        let frameInterval = 1000 / FPS;
+        console.log(`🎯 Initial Target FPS: ${FPS}`);
+
+        function setFPS(newFPS) {
+            FPS = parseInt(newFPS);
+            frameInterval = 1000 / FPS;
+            console.log(`🎯 Target FPS Updated to: ${FPS}`);
+        }
+        // --- IDLE STATE ---
+        let currentLook = { x: 0, y: 0 };      // Where head is now
+        let targetLook = { x: 0, y: 0 };       // Where head wants to go
+        let nextLookChangeTime = 0;            // When to move head next
+        let blinkTimer = 0;                    // Custom blink logic
+
+        // Helper: Simple organic noise (composed sine waves)
+        const noise = (t) => Math.sin(t) + Math.sin(t * 0.5) * 0.5 + Math.sin(t * 0.25) * 0.25;
+
+        function updateIdleAnimation(vrm, deltaTime, elapsedTime) {
+            // --- 1. ORGANIC BREATHING (Spine) ---
+            // Combine multiple sine waves so it doesn't look like a perfect loop
+            const breathe = (Math.sin(elapsedTime * 1.0) * 0.02) + (Math.sin(elapsedTime * 2.3) * 0.01);
+            const spine = vrm.humanoid.getNormalizedBoneNode('spine');
+            if (spine) {
+                spine.rotation.x = breathe;
+                // Add slight side-sway
+                spine.rotation.y = noise(elapsedTime * 0.5) * 0.03;
+                spine.rotation.z = noise(elapsedTime * 0.3) * 0.03;
+            }
+
+            // --- 2. SACCADIC HEAD MOVEMENT (The "VTuber Look") ---
+            // Randomly pick a new target every 1-4 seconds
+            if (elapsedTime > nextLookChangeTime) {
+                // Pick a random direction
+                const r = Math.random();
+                if (r < 0.5) {
+                    // 50% chance: Look at Camera (Center)
+                    targetLook = { x: 0, y: 0 };
+                    nextLookChangeTime = elapsedTime + 1.0 + Math.random() * 2.0;
+                } else if (r < 0.75) {
+                    // 25% chance: Look at Chat (Slight Left/Right)
+                    targetLook = { x: (Math.random() - 0.5) * 0.5, y: Math.random() * 0.1 };
+                    nextLookChangeTime = elapsedTime + 0.5 + Math.random() * 1.0;
+                } else {
+                    // 25% chance: Look Down/Thinking
+                    targetLook = { x: (Math.random() - 0.5) * 0.2, y: -0.1 };
+                    nextLookChangeTime = elapsedTime + 1.5;
+                }
+            }
+
+            // Smoothly Interpolate Head (Lerp)
+            // '0.01' is the speed. Lower = heavier/smoother head, Higher = snapper movement.
+            currentLook.x += (targetLook.x - currentLook.x) * 0.01;
+            currentLook.y += (targetLook.y - currentLook.y) * 0.01;
+
+            const neck = vrm.humanoid.getNormalizedBoneNode('neck');
+            const head = vrm.humanoid.getNormalizedBoneNode('head');
+
+            if (neck && head) {
+                // Distribute rotation between neck (40%) and head (60%) for natural feel
+                neck.rotation.y = currentLook.x * 0.4;
+                neck.rotation.x = currentLook.y * 0.4;
+
+                head.rotation.y = currentLook.x * 0.6;
+                head.rotation.x = currentLook.y * 0.6;
+
+                // Add tiny micro-movements (jitter) to keep it alive
+                head.rotation.z = noise(elapsedTime * 2.0) * 0.01;
+            }
+
+            // --- 3. ARM FIX (T-Pose Correction) ---
+            const leftArm = vrm.humanoid.getNormalizedBoneNode('leftUpperArm');
+            if (leftArm) {
+                leftArm.rotation.z = -armOffset;
+                // Add shoulder breathing
+                leftArm.rotation.x = breathe * 0.5;
+            }
+
+            const rightArm = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
+            if (rightArm) {
+                rightArm.rotation.z = armOffset;
+                rightArm.rotation.x = breathe * 0.5;
+            }
+
+            // --- 4. BLINKING LOGIC ---
+            // Random double-blinks and variety
+            if (elapsedTime > blinkTimer) {
+                vrm.expressionManager.setValue('blink', 1);
+
+                // Close eyes for 100ms
+                setTimeout(() => vrm.expressionManager.setValue('blink', 0), 100);
+
+                // Set next blink time (random 2s - 6s)
+                blinkTimer = elapsedTime + 2 + Math.random() * 4;
+
+                // 10% chance of double blink
+                if (Math.random() < 0.1) {
+                    setTimeout(() => {
+                        vrm.expressionManager.setValue('blink', 1);
+                        setTimeout(() => vrm.expressionManager.setValue('blink', 0), 100);
+                    }, 200);
+                }
+            }
+
+            // Apply Changes
+            vrm.update(deltaTime);
+        }
+
+        let lastFrameTime = 0;
+        // --- Animation Loop ---
+        function animate(timestamp) {
+            requestAnimationFrame(animate);
+
+            // Throttle rendering to target FPS
+            const delta = timestamp - lastFrameTime;
+            if (delta < frameInterval) return;
+
+            // Force a pixel change to trick Chrome into painting the frame
+            if (renderer && scene) {
+                // Imperceptibly move the camera back and forth
+                camera.position.z += Math.sin(timestamp * 0.001) * 0.0001;
+            }
+
+            // Adjust lastFrameTime to catch up, but not drift
+            lastFrameTime = timestamp - (delta % frameInterval);
+
+            // Handle 3D rendering
+            if (renderer) {
+                const deltaTime = clock.getDelta();
+                const elapsedTime = clock.elapsedTime;
+
+                if (currentVrm) {
+                    // 1. Idle & Update
+                    updateIdleAnimation(currentVrm, deltaTime, elapsedTime);
+
+                    // --- Camera Tracking & Shot Interpolation ---
+                    // Interpolate state values
+                    const lerpFactor = 0.05; // Smoothness
+                    currentShotState.dist += (targetShot.dist - currentShotState.dist) * lerpFactor;
+                    currentShotState.offsetX += (targetShot.offsetX - currentShotState.offsetX) * lerpFactor;
+                    currentShotState.offsetY += (targetShot.offsetY - currentShotState.offsetY) * lerpFactor;
+
+                    // Find Head Position
+                    const headNode = currentVrm.humanoid.getNormalizedBoneNode('head');
+                    if (headNode) {
+                        const headPos = new THREE.Vector3();
+                        headNode.getWorldPosition(headPos);
+
+                        // Position Camera:
+                        // X is aligned with head + offsetX (but camera moves, head stays)
+                        // Actually, if we want head centered, camera should equal headPos.x
+                        // If we want head OFFSET to the right (screen right), camera must move LEFT.
+                        // Screen Coordinate System:
+                        // Camera at (0,0), subject at (0,0) -> Centered.
+                        // Subject at (1,0) -> Subject is to Right.
+                        // So if we want subject at OffsetX, we can move the Camera to (HeadX - OffsetX).
+
+                        camera.position.set(
+                            headPos.x - currentShotState.offsetX - modelOffsetX, // Camera moves opposite to intent
+                            headPos.y - currentShotState.offsetY - modelOffsetY,
+                            headPos.z + currentShotState.dist + zoomOffset
+                        );
+
+                        // Look strictly parallel to Z axis to keep flat plane look
+                        // Or look at the head?
+                        // If we move camera, looking at head (HeadX) causes rotation.
+                        // Rotation causes background to skew if attached to scene (BUT we attached BG to camera now!)
+                        // Since the 3D background plane is removed, the camera framing
+                        // remains locked to the head position without rotation skewing.
+                        camera.lookAt(headPos.x, headPos.y, headPos.z - 1.0);
+                    }
+
+
+                    // [FIX] Lip Sync Gating
+                    // The analyser receives silence until the nextStartTime arrived.
+                    // This creates natural sync without manual timers.
+                    if (analyser) {
+                        analyser.getByteFrequencyData(dataArray);
+                        let values = 0;
+                        for (let i = 0; i < dataArray.length; i++) values += dataArray[i];
+                        const average = values / dataArray.length;
+
+                        // [FIX] Noise Gate: Ignore values below 10 (Static/Hum)
+                        if (average > 10) {
+                            const volume = Math.min(1.0, (average / 100) * lipSyncMultiplier);
+                            currentVrm.expressionManager.setValue('aa', volume);
+                        } else {
+                            currentVrm.expressionManager.setValue('aa', 0);
+                        }
+                    }
+                }
+
+                // [FIX] NEW WATCHDOG
+                // If the audio buffer is truly empty (current time > end of last scheduled chunk),
+                // then we are silent. Force mouth closed.
+                // This works perfectly with buffered/burst audio.
+                if (audioContext && audioContext.currentTime > nextStartTime) {
+                    if (currentVrm) currentVrm.expressionManager.setValue('aa', 0);
+                }
+
+                renderer.render(scene, camera);
+            }
+            // Handle 2D canvas fallback
+            else if (ctx2d) {
+                // Redraw background
+                ctx2d.fillStyle = '#1a1a2e';
+                ctx2d.fillRect(0, 0, canvas2d.width, canvas2d.height);
+
+                // Draw text
+                ctx2d.fillStyle = '#ffffff';
+                ctx2d.font = '48px Arial';
+                ctx2d.textAlign = 'center';
+                ctx2d.fillText('LobStream Stream', canvas2d.width / 2, canvas2d.height / 2 - 50);
+                ctx2d.font = '24px Arial';
+                ctx2d.fillText('Audio Only Mode (Headless)', canvas2d.width / 2, canvas2d.height / 2 + 20);
+
+                // Add a timestamp so the stream has changing content
+                ctx2d.font = '16px monospace';
+                ctx2d.fillStyle = '#888';
+                ctx2d.fillText(new Date().toLocaleTimeString(), canvas2d.width / 2, canvas2d.height / 2 + 60);
+            }
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+
+</html>
